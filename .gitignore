@@ -1,0 +1,26 @@
+# Maven
+target/
+.mvn/wrapper/maven-wrapper.jar
+
+# Quarkus
+.quarkus/
+
+# IDE
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+
+# OS
+.DS_Store
+
+# Order processing runtime directories (keep .gitkeep, ignore actual files)
+inbox/*
+!inbox/.gitkeep
+processed/*
+!processed/.gitkeep
+error/*
+!error/.gitkeep
+processed-results/*
+!processed-results/.gitkeep
