@@ -1,0 +1,42 @@
+- onException:
+    exception:
+      - com.mycompany.integration.exception.OrderValidationException
+    handled:
+      constant: "true"
+    steps:
+      - log:
+          message: "Validation error for order: ${exception.message}"
+          loggingLevel: WARN
+      - setHeader:
+          name: CamelHttpResponseCode
+          constant: "400"
+      - setBody:
+          simple: '{"error":"Validation failed","message":"${exception.message}"}'
+
+- route:
+    id: order-rest-api-route
+    description: "POST /api/orders 수신 → 검증 → SEDA 비동기 전달"
+    from:
+      uri: platform-http:/api/orders
+      parameters:
+        httpMethodRestrict: POST
+      steps:
+        - log:
+            message: "REST API received order request"
+        - unmarshal:
+            json:
+              unmarshalType: com.mycompany.integration.model.OrderRequest
+        - bean:
+            ref: orderValidator
+            method: validate
+        - to:
+            uri: seda:incomingOrders
+            parameters:
+              waitForTaskToComplete: Never
+        - setHeader:
+            name: CamelHttpResponseCode
+            constant: "202"
+        - setBody:
+            simple: '{"status":"accepted","orderId":"${header.orderId}","message":"Order received and queued for processing"}'
+        - log:
+            message: "Order ${header.orderId} accepted and queued"

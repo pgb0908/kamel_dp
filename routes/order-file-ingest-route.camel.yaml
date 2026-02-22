@@ -1,0 +1,45 @@
+- onException:
+    exception:
+      - java.lang.Exception
+    handled:
+      constant: "true"
+    steps:
+      - log:
+          message: "File ingest error for file ${header.CamelFileName}: ${exception.message}"
+          loggingLevel: ERROR
+
+- route:
+    id: order-file-ingest-route
+    description: "inbox/ 폴링 → JSON 파싱 → Splitter → SEDA"
+    from:
+      uri: "file:inbox"
+      parameters:
+        include: ".*\\.json"
+        move: "../processed"
+        moveFailed: "../error"
+        readLock: changed
+        readLockCheckInterval: 1000
+      steps:
+        - log:
+            message: "File received: ${header.CamelFileName}"
+        - bean:
+            ref: orderFileParser
+            method: parseOrders
+        - split:
+            simple: "${body}"
+            steps:
+              - log:
+                  message: "Splitting order: ${body.orderId}"
+              - setHeader:
+                  name: orderId
+                  simple: "${body.orderId}"
+              - setHeader:
+                  name: orderType
+                  simple: "${body.orderType}"
+              - setHeader:
+                  name: customerId
+                  simple: "${body.customerId}"
+              - to:
+                  uri: seda:incomingOrders
+        - log:
+            message: "File ${header.CamelFileName} ingested successfully"

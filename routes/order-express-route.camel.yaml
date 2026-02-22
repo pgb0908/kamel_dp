@@ -1,0 +1,17 @@
+- route:
+    id: order-express-route
+    description: "EXPRESS 주문 처리 → 결과 파일 저장"
+    from:
+      uri: direct:expressOrder
+      steps:
+        - log:
+            message: "EXPRESS processing: ${header.orderId} (tier=${header.customerTier})"
+        - bean:
+            ref: orderProcessor
+            method: processExpress
+        - marshal:
+            json: {}
+        - to:
+            uri: "file:processed-results"
+        - log:
+            message: "EXPRESS order ${header.orderId} completed and saved"

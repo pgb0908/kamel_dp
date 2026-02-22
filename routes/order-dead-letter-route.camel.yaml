@@ -1,0 +1,19 @@
+- route:
+    id: order-dead-letter-route
+    description: "Dead Letter Channel — 실패 주문 아카이브"
+    from:
+      uri: direct:deadLetterOrder
+      steps:
+        - log:
+            message: "Dead letter received for order ${header.orderId}"
+            loggingLevel: ERROR
+        - bean:
+            ref: orderErrorHandler
+            method: createDeadLetterRecord
+        - marshal:
+            json: {}
+        - to:
+            uri: "file:error"
+        - log:
+            message: "Dead letter archived: ${header.CamelFileName}"
+            loggingLevel: WARN

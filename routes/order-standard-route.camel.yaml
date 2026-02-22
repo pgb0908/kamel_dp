@@ -1,0 +1,26 @@
+- route:
+    id: order-standard-route
+    description: "STANDARD 주문 처리 — Filter(quantity>0) → 결과 파일 저장"
+    from:
+      uri: direct:standardOrder
+      steps:
+        - filter:
+            simple: "${body.quantity} > 0"
+            steps:
+              - log:
+                  message: "STANDARD processing: ${header.orderId} (qty=${body.quantity})"
+              - bean:
+                  ref: orderProcessor
+                  method: processStandard
+              - marshal:
+                  json: {}
+              - to:
+                  uri: "file:processed-results"
+              - log:
+                  message: "STANDARD order ${header.orderId} completed and saved"
+        - filter:
+            simple: "${body.quantity} <= 0"
+            steps:
+              - log:
+                  message: "STANDARD order ${header.orderId} skipped — zero/negative quantity"
+                  loggingLevel: WARN

@@ -1,0 +1,50 @@
+- onException:
+    exception:
+      - java.lang.Exception
+    handled:
+      constant: "true"
+    redeliveryPolicy:
+      maximumRedeliveries: 3
+      redeliveryDelay: 2000
+      backOffMultiplier: 2.0
+      useExponentialBackOff: true
+    steps:
+      - log:
+          message: "Max retries exhausted for order ${header.orderId}: ${exception.message}"
+          loggingLevel: ERROR
+      - to:
+          uri: direct:deadLetterOrder
+
+- route:
+    id: order-processing-route
+    description: "중앙 오케스트레이션 — Idempotent Consumer → Enricher → CBR"
+    from:
+      uri: seda:incomingOrders
+      parameters:
+        concurrentConsumers: 4
+      steps:
+        - log:
+            message: "Processing order from queue: ${header.orderId}"
+        - idempotentConsumer:
+            simple: "${header.orderId}"
+            idempotentRepository: "#bean:orderIdempotentRepository"
+            steps:
+              - log:
+                  message: "New order ${header.orderId} — enriching and routing"
+              - bean:
+                  ref: orderEnricher
+                  method: enrich
+              - choice:
+                  when:
+                    - simple: "${header.orderType} == 'EXPRESS'"
+                      steps:
+                        - log:
+                            message: "Routing to EXPRESS lane: ${header.orderId}"
+                        - to:
+                            uri: direct:expressOrder
+                  otherwise:
+                    steps:
+                      - log:
+                          message: "Routing to STANDARD lane: ${header.orderId}"
+                      - to:
+                          uri: direct:standardOrder
