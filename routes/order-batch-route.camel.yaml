@@ -1,0 +1,280 @@
+# =============================================================================
+# Batch Order Aggregation & Fulfillment Routes
+# =============================================================================
+# 흐름: POST /api/orders/batch → validate → seda:orderBatch
+#       → AGG1(customerId) → split + AGG2(customerId+orderType)
+#       → AGG3/combine → choice(bulk|vip|standard) → doTry/doCatch + file
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 배치 엔트리 전용 onException: ValidationException → 400 반환
+# -----------------------------------------------------------------------------
+- onException:
+    exception:
+      - com.mycompany.integration.exception.OrderValidationException
+    handled:
+      constant: "true"
+    steps:
+      - log:
+          message: "Batch validation error: ${exception.message}"
+          loggingLevel: WARN
+      - setHeader:
+          name: CamelHttpResponseCode
+          constant: "400"
+      - setBody:
+          simple: '{"error":"Batch validation failed","message":"${exception.message}"}'
+
+# -----------------------------------------------------------------------------
+# Route 1: order-batch-entry-route
+# POST /api/orders/batch → validate → seda:orderBatch (비동기)
+# -----------------------------------------------------------------------------
+- route:
+    id: order-batch-entry-route
+    description: "배치 주문 수신 → 검증 → SEDA 큐 비동기 전달"
+    from:
+      uri: platform-http:/api/orders/batch
+      parameters:
+        httpMethodRestrict: POST
+      steps:
+        - log:
+            message: "Batch API received order"
+        - unmarshal:
+            json:
+              unmarshalType: com.mycompany.integration.model.OrderRequest
+        - bean:
+            ref: orderValidator
+            method: validate
+        - to:
+            uri: seda:orderBatch
+            parameters:
+              waitForTaskToComplete: Never
+        - setHeader:
+            name: CamelHttpResponseCode
+            constant: "202"
+        - setBody:
+            simple: '{"status":"accepted","orderId":"${header.orderId}","customerId":"${header.customerId}","message":"Order received and queued for batch processing"}'
+        - log:
+            message: "Batch order ${header.orderId} (customer=${header.customerId}) accepted"
+
+# -----------------------------------------------------------------------------
+# Route 2: order-batch-agg1-route
+# seda:orderBatch → AGG1 by customerId → direct:agg2Input
+# completionSize=10 OR completionTimeout=10s
+# -----------------------------------------------------------------------------
+- route:
+    id: order-batch-agg1-route
+    description: "AGG1: customerId별 주문 집계 → CustomerBatch Map"
+    from:
+      uri: seda:orderBatch
+      parameters:
+        concurrentConsumers: 2
+      steps:
+        - log:
+            message: "AGG1: received order ${header.orderId} for customer ${header.customerId}"
+        - aggregate:
+            correlationExpression:
+              simple: "${header.customerId}"
+            completionSize: 10
+            completionTimeout: 10000
+            aggregationStrategy: "#bean:customerOrderAggregator"
+            steps:
+              - log:
+                  message: "AGG1 complete: CustomerBatch for customerId=${body[customerId]}, orders=${body[orders].size()}"
+              - to:
+                  uri: direct:agg2Input
+
+# -----------------------------------------------------------------------------
+# Route 3: order-batch-agg2-route
+# direct:agg2Input → split orders → AGG2 by (customerId+orderType) → direct:agg3Input
+# -----------------------------------------------------------------------------
+- route:
+    id: order-batch-agg2-route
+    description: "AGG2: CustomerBatch split → orderType별 TypeSummary 집계"
+    from:
+      uri: direct:agg2Input
+      steps:
+        - log:
+            message: "AGG2: processing CustomerBatch for customerId=${body[customerId]}, tier=${body[customerTier]}"
+        - setHeader:
+            name: customerId
+            simple: "${body[customerId]}"
+        - setHeader:
+            name: customerTier
+            simple: "${body[customerTier]}"
+        - split:
+            expression:
+              simple: "${body[orders]}"
+            steps:
+              - setHeader:
+                  name: orderType
+                  simple: "${body[orderType]}"
+              - log:
+                  message: "AGG2 split: orderId=${body[orderId]}, orderType=${header.orderType}, qty=${body[quantity]}"
+              - aggregate:
+                  correlationExpression:
+                    simple: "${header.customerId}-${header.orderType}"
+                  completionTimeout: 5000
+                  aggregationStrategy: "#bean:typeGroupAggregator"
+                  steps:
+                    - log:
+                        message: "AGG2 complete: TypeSummary ${body[customerId]}-${body[orderType]}, count=${body[count]}, totalQty=${body[totalQuantity]}"
+                    - to:
+                        uri: direct:agg3Input
+
+# -----------------------------------------------------------------------------
+# Route 4: order-batch-agg3-route
+# direct:agg3Input → AGG3 by customerId → prepareHeaders → choice
+# -----------------------------------------------------------------------------
+- route:
+    id: order-batch-agg3-route
+    description: "AGG3: TypeSummary 결합 → BatchReport → fulfillment 분기"
+    from:
+      uri: direct:agg3Input
+      steps:
+        - log:
+            message: "AGG3: received TypeSummary for customerId=${body[customerId]}, orderType=${body[orderType]}"
+        - aggregate:
+            correlationExpression:
+              simple: "${body[customerId]}"
+            completionTimeout: 3000
+            aggregationStrategy: "#bean:batchReportCombiner"
+            steps:
+              - log:
+                  message: "AGG3 complete: BatchReport batchId=${body[batchId]}, customerId=${body[customerId]}, totalOrders=${body[totalOrders]}, totalQty=${body[totalQuantity]}"
+              - bean:
+                  ref: batchFulfillmentHandler
+                  method: prepareHeaders
+              - choice:
+                  when:
+                    - simple: "${header.totalQuantity} > 100"
+                      steps:
+                        - log:
+                            message: "Routing to BULK fulfillment: batchId=${header.batchId}, totalQty=${header.totalQuantity}"
+                        - to:
+                            uri: direct:bulkFulfillment
+                    - simple: "${header.customerTier} == 'VIP'"
+                      steps:
+                        - log:
+                            message: "Routing to VIP fulfillment: batchId=${header.batchId}, customerId=${header.customerId}"
+                        - to:
+                            uri: direct:vipFulfillment
+                  otherwise:
+                    steps:
+                      - log:
+                          message: "Routing to STANDARD fulfillment: batchId=${header.batchId}, customerId=${header.customerId}"
+                      - to:
+                          uri: direct:standardFulfillment
+
+# -----------------------------------------------------------------------------
+# Route 5: order-batch-bulk-fulfillment-route
+# direct:bulkFulfillment → doTry(processBulk + file) / doCatch(compensate + file)
+# -----------------------------------------------------------------------------
+- route:
+    id: order-batch-bulk-fulfillment-route
+    description: "BULK fulfillment: 대량 주문 처리 (totalQuantity > 100)"
+    from:
+      uri: direct:bulkFulfillment
+      steps:
+        - doTry:
+            steps:
+              - bean:
+                  ref: batchFulfillmentHandler
+                  method: processBulk
+              - marshal:
+                  json: {}
+              - to:
+                  uri: "file:batch-reports"
+              - log:
+                  message: "BULK fulfillment saved: ${header.CamelFileName}"
+            doCatch:
+              - exception:
+                  - java.lang.Exception
+                steps:
+                  - log:
+                      message: "BULK fulfillment failed, compensating: ${exception.message}"
+                      loggingLevel: ERROR
+                  - bean:
+                      ref: batchFulfillmentHandler
+                      method: compensate
+                  - marshal:
+                      json: {}
+                  - to:
+                      uri: "file:error"
+                  - log:
+                      message: "BULK compensation record saved: ${header.CamelFileName}"
+
+# -----------------------------------------------------------------------------
+# Route 6: order-batch-vip-fulfillment-route
+# direct:vipFulfillment → doTry(processVip + file) / doCatch(compensate + file)
+# -----------------------------------------------------------------------------
+- route:
+    id: order-batch-vip-fulfillment-route
+    description: "VIP fulfillment: VIP 고객 우선 처리"
+    from:
+      uri: direct:vipFulfillment
+      steps:
+        - doTry:
+            steps:
+              - bean:
+                  ref: batchFulfillmentHandler
+                  method: processVip
+              - marshal:
+                  json: {}
+              - to:
+                  uri: "file:batch-reports"
+              - log:
+                  message: "VIP fulfillment saved: ${header.CamelFileName}"
+            doCatch:
+              - exception:
+                  - java.lang.Exception
+                steps:
+                  - log:
+                      message: "VIP fulfillment failed, compensating: ${exception.message}"
+                      loggingLevel: ERROR
+                  - bean:
+                      ref: batchFulfillmentHandler
+                      method: compensate
+                  - marshal:
+                      json: {}
+                  - to:
+                      uri: "file:error"
+                  - log:
+                      message: "VIP compensation record saved: ${header.CamelFileName}"
+
+# -----------------------------------------------------------------------------
+# Route 7: order-batch-standard-fulfillment-route
+# direct:standardFulfillment → doTry(processStandard + file) / doCatch(compensate + file)
+# -----------------------------------------------------------------------------
+- route:
+    id: order-batch-standard-fulfillment-route
+    description: "STANDARD fulfillment: 일반 주문 처리"
+    from:
+      uri: direct:standardFulfillment
+      steps:
+        - doTry:
+            steps:
+              - bean:
+                  ref: batchFulfillmentHandler
+                  method: processStandard
+              - marshal:
+                  json: {}
+              - to:
+                  uri: "file:batch-reports"
+              - log:
+                  message: "STANDARD fulfillment saved: ${header.CamelFileName}"
+            doCatch:
+              - exception:
+                  - java.lang.Exception
+                steps:
+                  - log:
+                      message: "STANDARD fulfillment failed, compensating: ${exception.message}"
+                      loggingLevel: ERROR
+                  - bean:
+                      ref: batchFulfillmentHandler
+                      method: compensate
+                  - marshal:
+                      json: {}
+                  - to:
+                      uri: "file:error"
+                  - log:
+                      message: "STANDARD compensation record saved: ${header.CamelFileName}"
